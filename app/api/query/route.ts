@@ -39,6 +39,162 @@ function questionHasExplicitYear(question: string) {
   return /\b(19|20)\d{2}\b/.test(question);
 }
 
+function normalizeForMatch(value: string) {
+  return String(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function similarityScore(input: string, candidate: string) {
+  const a = normalizeForMatch(input);
+  const b = normalizeForMatch(candidate);
+
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (b.includes(a) || a.includes(b)) return 0.95;
+
+  const aChars = new Set(a.split(""));
+  const bChars = new Set(b.split(""));
+
+  const intersection = [...aChars].filter((char) => bChars.has(char)).length;
+  const union = new Set([...aChars, ...bChars]).size;
+
+  return union === 0 ? 0 : intersection / union;
+}
+
+function getFieldType(field: string, rawSemanticModel: any) {
+  const [entityName, columnName] = field.split(".");
+
+  const entity = rawSemanticModel.entities?.find(
+    (e: any) => e.name === entityName
+  );
+
+  if (!entity) return null;
+
+  const column = entity.columns?.find((c: any) => c.name === columnName);
+
+  return column?.type || null;
+}
+
+async function resolveTextFilterValue(
+  projectDb: any,
+  rawSemanticModel: any,
+  field: string,
+  value: any
+) {
+  if (typeof value !== "string") return value;
+
+  const fieldType = getFieldType(field, rawSemanticModel);
+
+  if (fieldType !== "string" && fieldType !== "text") {
+    return value;
+  }
+
+  const [table, column] = field.split(".");
+
+  if (!table || !column) return value;
+
+  const distinctSql = `
+    SELECT DISTINCT ${quoteIdent(column)} AS value
+    FROM ${quoteIdent(table)}
+    WHERE ${quoteIdent(column)} IS NOT NULL
+    LIMIT 200
+  `;
+
+  const rows = await projectDb.unsafe(distinctSql);
+  const candidates = rows.map((row: any) => String(row.value));
+
+  if (candidates.length === 0) return value;
+
+  let bestCandidate = value;
+  let bestScore = 0;
+
+  for (const candidate of candidates) {
+    const score = similarityScore(value, candidate);
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestCandidate = candidate;
+    }
+  }
+
+  if (bestScore >= 0.65) {
+    return bestCandidate;
+  }
+
+  return value;
+}
+
+async function resolveFilterValues(
+  semanticQuery: any,
+  projectDb: any,
+  rawSemanticModel: any
+) {
+  const resolvedFilters = [];
+
+  for (const filter of semanticQuery.filters || []) {
+    resolvedFilters.push({
+      ...filter,
+      value: await resolveTextFilterValue(
+        projectDb,
+        rawSemanticModel,
+        filter.field,
+        filter.value
+      ),
+    });
+  }
+
+  const resolvedFilterGroups = [];
+
+  for (const group of semanticQuery.filterGroups || []) {
+    const resolvedGroup = [];
+
+    for (const filter of group || []) {
+      resolvedGroup.push({
+        ...filter,
+        value: await resolveTextFilterValue(
+          projectDb,
+          rawSemanticModel,
+          filter.field,
+          filter.value
+        ),
+      });
+    }
+
+    resolvedFilterGroups.push(resolvedGroup);
+  }
+
+  return {
+    ...semanticQuery,
+    filters: resolvedFilters,
+    filterGroups: resolvedFilterGroups,
+  };
+}
+
+function relaxExactNumericFiltersForReasoning(question: string, semanticQuery: any) {
+  const shouldRelax =
+    /\b(better|money-wise|moneywise|value|worth|idea)\b/i.test(question);
+
+  if (!shouldRelax) {
+    return semanticQuery;
+  }
+
+  const relaxedFilterGroups = (semanticQuery.filterGroups || []).map(
+    (group: any[]) =>
+      group.filter((filter: any) => {
+        const isExactNumericFilter =
+          filter.operator === "=" && typeof filter.value === "number";
+
+        return !isExactNumericFilter;
+      })
+  );
+
+  return {
+    ...semanticQuery,
+    filterGroups: relaxedFilterGroups,
+  };
+}
+
 async function getDateContext(projectDb: any, rawSemanticModel: any) {
   const dateColumns =
     rawSemanticModel.entities?.flatMap((entity: any) =>
@@ -167,20 +323,25 @@ function resolveMonthAmbiguity(question: string, monthYearContext: any[]) {
   }
 
   if (ambiguousMessages.length > 0) {
+    const firstMonth = mentionedMonths[0];
+    const suggestedYear = Array.from(
+      new Set(
+        monthYearContext.flatMap((ctx) =>
+          ctx.values
+            .filter((value: any) => value.month === firstMonth.value)
+            .map((value: any) => value.year)
+        )
+      )
+    )[0];
+
     return {
       type: "ambiguous",
       hints: [],
       message: `${ambiguousMessages.join(
         " "
-      )} Which year do you mean? For example, ask "number of bookings in ${mentionedMonths[0].label} ${Array.from(
-        new Set(
-          monthYearContext.flatMap((ctx) =>
-            ctx.values
-              .filter((value: any) => value.month === mentionedMonths[0].value)
-              .map((value: any) => value.year)
-          )
-        )
-      )[0]}".`,
+      )} Which year do you mean? For example, ask "number of bookings in ${
+        firstMonth.label
+      } ${suggestedYear}".`,
     };
   }
 
@@ -188,7 +349,9 @@ function resolveMonthAmbiguity(question: string, monthYearContext: any[]) {
     return {
       type: "missing",
       hints: [],
-      message: `${missingMessages.join(" ")} Please try a month/year that exists in the data.`,
+      message: `${missingMessages.join(
+        " "
+      )} Please try a month/year that exists in the data.`,
     };
   }
 
@@ -228,6 +391,7 @@ async function mapQuestionToSemanticQuery(
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",
+      response_format: { type: "json_object" },
       messages: [
         {
           role: "system",
@@ -256,7 +420,7 @@ ${JSON.stringify(dateResolutionHints, null, 2)}
 
 FILTER FORMAT:
 - field must be one of the DIMENSIONS above, without the type label
-- operator: =, >, <, >=, <=
+- operator: =, !=, >, <, >=, <=
 - value: string, number, or date in YYYY-MM-DD format
 
 DATE RULES:
@@ -267,16 +431,46 @@ DATE RULES:
 - For a month filter, use a date range:
   - first filter: >= first day of month
   - second filter: < first day of next month
-- Example:
-  [
-    { "field": "bookings.booking_date", "operator": ">=", "value": "2026-03-01" },
-    { "field": "bookings.booking_date", "operator": "<", "value": "2026-04-01" }
-  ]
+
+LOOKUP / PRICE / RATE RULES:
+- If the user asks for rates, prices, cost, fee, charge, or "how much", this is usually a lookup question, not an aggregate question.
+- For lookup questions, prefer returning relevant columns as dimensions instead of using sum/count metrics.
+- If the user asks "how much would it cost" for a specific duration, return the relevant amount/price/rate field as a dimension and filter by the matching numeric duration field.
+- For rate/cost lookup questions, include the rate/price field, the relevant descriptive text field, and any numeric condition field such as duration_hours in dimensions.
+- If the user asks a comparison question involving cost, price, rate, money-wise, value, better, cheaper, or expensive, retrieve enough candidate rows for reasoning instead of only exact matches.
+- If an exact numeric value may not exist in the data, do not over-filter to only that exact value. Include the relevant descriptive field, numeric field, and price/rate field so the answer layer can reason from available rows.
+- For rate/cost comparison questions, prefer dimensions that show the available options, such as descriptive name/type fields, duration/quantity fields, and amount/price/rate fields.
+- Do NOT use count(*) or sum(...) unless the user asks for totals, counts, revenue, average, top, highest, or lowest.
+- If a user asks about a duration/quantity/amount that may not exist exactly, do not filter only to that exact numeric value. Retrieve available rows for the relevant named option and include the numeric field in dimensions so the answer layer can reason from nearby available values.
+- For "better", "money-wise", "value", or comparison questions, prefer retrieving candidate rows for each named option rather than requiring every numeric condition to match exactly.
+
+VALUE FILTER RULES:
+- If the user mentions a specific named/descriptive value such as a room name, customer name, country, instrument, product, status, type, category, or other business value, you MUST add a filter using the most relevant text dimension.
+- Choose the filter field ONLY from the available DIMENSIONS.
+- Prefer text fields whose names include: name, room, customer, country, instrument, type, status, category, product.
+- Do NOT ignore named values in the question.
+- For text filters, use operator "=". The backend will resolve fuzzy/misspelled values against actual database values.
+- If the user mentions a numeric duration, amount, quantity, price, or rate, add a numeric filter using the most relevant numeric field.
+
+COMPARISON / OR FILTER RULES:
+- If the user compares two or more alternatives, use "filterGroups".
+- Each alternative must be represented as one filter group.
+- Conditions inside one group are ANDed together.
+- Different groups are ORed together.
+- Do NOT put mutually exclusive alternatives into the normal "filters" array.
+- Use normal "filters" only for conditions that apply to all alternatives.
+- Choose fields only from available DIMENSIONS.
+- For named/descriptive values, use the most relevant text dimension.
+- For numeric values such as duration, amount, quantity, price, or rate, use the most relevant numeric field.
+- For comparison questions, include in dimensions every field needed to identify each option being compared, including the compared text field and numeric condition fields.
+- If alternatives differ by a numeric duration, include that duration field in dimensions.
+- Do not return only the compared value; include enough fields for the final answer to identify which row belongs to which option.
 
 ORDERING:
-- For "top", "highest", "best" → use DESC
-- For "lowest", "least" → use ASC
-- orderBy.field MUST be a metric
+- For "top", "highest", "best", "more expensive", "costlier", "highest cost" use DESC
+- For "lowest", "least", "cheapest", "least expensive" use ASC
+- orderBy.field should be a metric when using aggregate metrics
+- For lookup/rate/cost questions without aggregate metrics, orderBy.field may be a selected numeric dimension
 - Use limit for top N queries
 
 RULES:
@@ -284,7 +478,7 @@ RULES:
 - Do NOT invent names
 - You MUST use field names EXACTLY as provided
 - Do NOT shorten or modify field names
-- Output ONLY valid JSON
+- Output ONLY one valid JSON object. Do not include markdown, explanation, comments, or text before/after the JSON.
 
 FORMAT:
 {
@@ -292,6 +486,11 @@ FORMAT:
   "dimensions": [],
   "filters": [
     { "field": "", "operator": "", "value": "" }
+  ],
+  "filterGroups": [
+    [
+      { "field": "", "operator": "", "value": "" }
+    ]
   ],
   "orderBy": {
     "field": "",
@@ -325,6 +524,78 @@ FORMAT:
   return JSON.parse(text);
 }
 
+async function synthesizeAnswer({
+  question,
+  semanticQuery,
+  sql,
+  rows,
+  warning,
+}: {
+  question: string;
+  semanticQuery: any;
+  sql: string;
+  rows: any[];
+  warning?: string | null;
+}) {
+  const res = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [
+        {
+          role: "system",
+          content: `
+You are a helpful data analyst.
+
+Use only the provided SQL result rows. Do not invent data.
+
+Your job:
+- Answer the user's question in plain English.
+- If the question is subjective, such as "better", explain the possible interpretations.
+- If relevant, compare options using the returned values.
+- If the result is empty, say no matching rows were found and suggest what may be missing.
+- If the exact requested option is missing but nearby/relevant rows are available, explain that clearly.
+- You may make a conditional estimate only if it is based on visible rows, and you must state the assumption.
+- Example style: "There is no exact 3-hour rate. If combining a 2-hour and 1-hour rate is allowed, the estimate would be..."
+- Do not treat assumptions as facts.
+- Keep the answer concise.
+- Do not show SQL unless asked.
+          `,
+        },
+        {
+          role: "user",
+          content: JSON.stringify(
+            {
+              question,
+              semanticQuery,
+              sql,
+              rows,
+              warning,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+      temperature: 0,
+    }),
+  });
+
+  const data = await res.json();
+
+  console.log("ANSWER RAW RESPONSE:", JSON.stringify(data, null, 2));
+
+  if (!data.choices || !data.choices[0]) {
+    return "I got the data, but could not generate a written answer.";
+  }
+
+  return data.choices[0].message.content;
+}
+
 function validateFilters(semanticQuery: any, semanticModel: any) {
   const validFields = new Set(
     semanticModel.entities.flatMap((e: any) =>
@@ -340,10 +611,21 @@ function validateFilters(semanticQuery: any, semanticModel: any) {
     return isValid;
   });
 
+  const validFilterGroups = (semanticQuery.filterGroups || [])
+    .map((group: any[]) =>
+      group.filter((f: any) => {
+        const isValid = validFields.has(f.field);
+        if (!isValid) removed = true;
+        return isValid;
+      })
+    )
+    .filter((group: any[]) => group.length > 0);
+
   return {
     query: {
       ...semanticQuery,
       filters: validFilters,
+      filterGroups: validFilterGroups,
     },
     warning: removed ? "Some filters were ignored due to invalid fields" : null,
   };
@@ -362,7 +644,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // 1. Get project (main DB)
     const projectRes = await sql`
       SELECT * FROM projects WHERE id = ${projectId}
     `;
@@ -376,7 +657,6 @@ export async function POST(req: Request) {
       );
     }
 
-    // 2. Get semantic model
     const semanticRes = await sql`
       SELECT * FROM semantic_models WHERE project_id = ${projectId}
     `;
@@ -390,15 +670,17 @@ export async function POST(req: Request) {
       );
     }
 
-    // 3. Parse semantic JSON
     const raw =
       typeof semanticRow.semantic_json === "string"
         ? JSON.parse(semanticRow.semantic_json)
         : semanticRow.semantic_json;
 
-    const metricsMap: Record<string, string> = {};
+    const metricsMap: Record<string, { formula: string; table?: string }> = {};
     raw.metrics.forEach((m: any) => {
-      metricsMap[m.name] = m.formula;
+      metricsMap[m.name] = {
+        formula: m.formula,
+        table: m.table,
+      };
     });
 
     const relationships = raw.relationships.map((r: any) => ({
@@ -415,29 +697,27 @@ export async function POST(req: Request) {
 
     console.log("SEMANTIC MODEL:", semanticModel);
 
-    // 4. Connect to project DB
     const projectDb = getProjectDb(project.db_connection_string);
 
-    // 5. Get available date context from actual data
     const dateContext = await getDateContext(projectDb, raw);
     const monthYearContext = await getAvailableMonthYears(projectDb, raw);
 
     console.log("DATE CONTEXT:", dateContext);
     console.log("MONTH/YEAR CONTEXT:", monthYearContext);
 
-    // 6. Deterministic ambiguity check before OpenAI
     const dateResolution = resolveMonthAmbiguity(query, monthYearContext);
 
     if (dateResolution.message) {
       return NextResponse.json({
         success: true,
+        answer: dateResolution.message,
+        semanticQuery: null,
         data: [],
-        sql: dateResolution.message,
+        sql: "",
         warning: "Date clarification required",
       });
     }
 
-    // 7. Map user query → semanticQuery
     let semanticQuery = await mapQuestionToSemanticQuery(
       query,
       semanticModel,
@@ -448,7 +728,6 @@ export async function POST(req: Request) {
 
     console.log("SEMANTIC QUERY (RAW):", semanticQuery);
 
-    // 8. Apply validation
     const { query: validatedQuery, warning } = validateFilters(
       semanticQuery,
       semanticModel
@@ -456,24 +735,34 @@ export async function POST(req: Request) {
 
     semanticQuery = validatedQuery;
 
-    console.log("SEMANTIC QUERY (VALIDATED):", semanticQuery);
+    semanticQuery = await resolveFilterValues(semanticQuery, projectDb, raw);
 
-    // 9. Guard
-    if (!semanticQuery.metrics) {
+    semanticQuery = relaxExactNumericFiltersForReasoning(query, semanticQuery);
+
+    console.log("SEMANTIC QUERY (RESOLVED):", semanticQuery);
+
+    if (!semanticQuery.metrics && !semanticQuery.dimensions) {
       throw new Error("Invalid semantic query generated");
     }
 
-    // 10. Generate SQL
     const generatedSQL = buildSQL(semanticQuery, semanticModel);
 
     console.log("\nGenerated SQL:\n", generatedSQL);
 
-    // 11. Execute query
     const result = await projectDb.unsafe(generatedSQL);
 
-    // 12. Return result
+    const answer = await synthesizeAnswer({
+      question: query,
+      semanticQuery,
+      sql: generatedSQL,
+      rows: result,
+      warning,
+    });
+
     return NextResponse.json({
       success: true,
+      answer,
+      semanticQuery,
       data: result,
       sql: generatedSQL,
       warning,

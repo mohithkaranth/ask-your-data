@@ -2,6 +2,7 @@ type SemanticQuery = {
   metrics?: string[];
   dimensions?: string[];
   filters?: any[];
+  filterGroups?: any[][];
   orderBy?: {
     field: string;
     direction: "asc" | "desc";
@@ -9,9 +10,16 @@ type SemanticQuery = {
   limit?: number;
 };
 
+type MetricDefinition =
+  | string
+  | {
+      formula: string;
+      table?: string;
+    };
+
 type SemanticModel = {
   entities: { name: string; columns: any[] }[];
-  metrics: Record<string, string>;
+  metrics: Record<string, MetricDefinition>;
   relationships: {
     from: string;
     to: string;
@@ -19,11 +27,94 @@ type SemanticModel = {
   }[];
 };
 
+function getMetricFormula(metricDef: MetricDefinition) {
+  if (typeof metricDef === "string") {
+    return metricDef;
+  }
+
+  return metricDef.formula;
+}
+
+function getMetricTable(metricDef: MetricDefinition) {
+  if (typeof metricDef === "string") {
+    return null;
+  }
+
+  return metricDef.table || null;
+}
+
+function getFieldType(field: string, model: SemanticModel) {
+  const [entityName, columnName] = field.split(".");
+
+  const entity = model.entities.find((e) => e.name === entityName);
+  if (!entity) return null;
+
+  const column = entity.columns.find((c: any) => c.name === columnName);
+  if (!column) return null;
+
+  return column.type;
+}
+
+function escapeSqlString(value: string) {
+  return value.replace(/'/g, "''");
+}
+
+function buildFuzzyValue(value: string) {
+  return escapeSqlString(value).trim().split(/\s+/).join("%");
+}
+
+function buildCondition(f: any, model: SemanticModel) {
+  if (!f.field || !f.operator) {
+    throw new Error("Invalid filter format");
+  }
+
+  const fieldType = getFieldType(f.field, model);
+  const operator = String(f.operator).trim();
+  const rawValue = f.value;
+
+  // Fuzzy matching for text/string equality.
+  // Example: "living room" -> ILIKE '%living%room%'
+  // This also matches "Living Room Studio" and "living_room".
+  if (
+    (fieldType === "string" || fieldType === "text") &&
+    operator === "=" &&
+    typeof rawValue === "string"
+  ) {
+    const fuzzyValue = buildFuzzyValue(rawValue);
+    return `${f.field} ILIKE '%${fuzzyValue}%'`;
+  }
+
+  if (
+    (fieldType === "string" || fieldType === "text") &&
+    operator === "!=" &&
+    typeof rawValue === "string"
+  ) {
+    const fuzzyValue = buildFuzzyValue(rawValue);
+    return `${f.field} NOT ILIKE '%${fuzzyValue}%'`;
+  }
+
+  let value;
+
+  if (
+    typeof rawValue === "string" &&
+    /^\d{4}-\d{2}-\d{2}$/.test(rawValue)
+  ) {
+    value = `'${escapeSqlString(rawValue)}'`;
+  } else if (typeof rawValue === "number") {
+    value = rawValue;
+  } else {
+    value = `'${escapeSqlString(String(rawValue))}'`;
+  }
+
+  return `${f.field} ${operator} ${value}`;
+}
+
 export function buildSQL(query: SemanticQuery, model: SemanticModel) {
   const {
     metrics = [],
     dimensions = [],
     filters = [],
+    filterGroups = [],
     orderBy,
     limit = 50,
   } = query;
@@ -46,14 +137,23 @@ export function buildSQL(query: SemanticQuery, model: SemanticModel) {
 
   // ---- Resolve metrics ----
   for (const metric of metrics) {
-    const expr = model.metrics[metric];
+    const metricDef = model.metrics[metric];
 
-    if (!expr) {
+    if (!metricDef) {
       throw new Error(`Metric not found: ${metric}`);
     }
 
+    const expr = getMetricFormula(metricDef);
+    const metricTable = getMetricTable(metricDef);
+
     selectParts.push(`${expr} as ${metric}`);
 
+    // Important for count(*) metrics
+    if (metricTable) {
+      tables.add(metricTable);
+    }
+
+    // Also detect table names inside formulas like sum(bookings.amount_paid)
     for (const entity of entityNames) {
       if (expr.includes(`${entity}.`)) {
         tables.add(entity);
@@ -69,6 +169,16 @@ export function buildSQL(query: SemanticQuery, model: SemanticModel) {
     }
   }
 
+  // ---- Resolve filter groups ----
+  for (const group of filterGroups) {
+    for (const f of group) {
+      if (f.field) {
+        const [entity] = f.field.split(".");
+        tables.add(entity);
+      }
+    }
+  }
+
   // ---- Build FROM + JOIN ----
   const tableList = Array.from(tables);
 
@@ -76,9 +186,7 @@ export function buildSQL(query: SemanticQuery, model: SemanticModel) {
     throw new Error("No tables resolved");
   }
 
-  const baseTable = tableList.includes("customers")
-    ? "customers"
-    : tableList[0];
+  const baseTable = tableList[0];
 
   let fromClause = `FROM ${baseTable}`;
 
@@ -117,30 +225,21 @@ export function buildSQL(query: SemanticQuery, model: SemanticModel) {
   // ---- WHERE ----
   let whereClause = "";
 
-  if (filters.length > 0) {
-    const conditions = filters.map((f) => {
-      if (!f.field || !f.operator) {
-        throw new Error("Invalid filter format");
-      }
+  const andConditions = filters.map((f) => buildCondition(f, model));
 
-      let value;
+  const orGroupConditions = filterGroups.map((group) => {
+    const groupConditions = group.map((f) => buildCondition(f, model));
+    return `(${groupConditions.join(" AND ")})`;
+  });
 
-      // 🔥 ADD: detect date format (YYYY-MM-DD)
-      if (
-        typeof f.value === "string" &&
-        /^\d{4}-\d{2}-\d{2}$/.test(f.value)
-      ) {
-        value = `'${f.value}'`; // date stays quoted
-      } else if (typeof f.value === "number") {
-        value = f.value;
-      } else {
-        value = `'${f.value}'`;
-      }
+  const allConditions = [...andConditions];
 
-      return `${f.field} ${f.operator} ${value}`;
-    });
+  if (orGroupConditions.length > 0) {
+    allConditions.push(`(${orGroupConditions.join(" OR ")})`);
+  }
 
-    whereClause = `WHERE ${conditions.join(" AND ")}`;
+  if (allConditions.length > 0) {
+    whereClause = `WHERE ${allConditions.join(" AND ")}`;
   }
 
   // ---- GROUP BY ----

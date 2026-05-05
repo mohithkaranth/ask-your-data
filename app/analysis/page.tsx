@@ -6,7 +6,11 @@ import { useRouter } from "next/navigation";
 type Message = {
   role: "user" | "system";
   content: string;
+  answer?: string;
+  sql?: string;
+  semanticQuery?: any;
   data?: any[];
+  warning?: string | null;
 };
 
 type Project = {
@@ -93,8 +97,12 @@ export default function AnalysisPage() {
         ...prev,
         {
           role: "system",
-          content: data.sql || "Here’s your result:",
+          content: data.answer || data.sql || "Here’s your result:",
+          answer: data.answer,
+          sql: data.sql,
+          semanticQuery: data.semanticQuery,
           data: data.data,
+          warning: data.warning,
         },
       ]);
     } catch (err: any) {
@@ -148,19 +156,22 @@ export default function AnalysisPage() {
 
       {/* CHAT AREA */}
       <div className="flex-1 overflow-y-auto p-6 space-y-4">
-        {messages.length === 0 && (
+        {messages.length === 0 && !projectId && (
           <div className="text-sm text-zinc-400">
-            Select a project and ask something like:{" "}
-            <span className="text-zinc-200">
-              total revenue by studio room
-            </span>
+            Select a project to start asking questions.
+          </div>
+        )}
+
+        {messages.length === 0 && projectId && (
+          <div className="text-sm text-zinc-400">
+            Ask a question about the selected project.
           </div>
         )}
 
         {messages.map((msg, idx) => (
           <div
             key={idx}
-            className={`max-w-xl ${
+            className={`max-w-4xl ${
               msg.role === "user" ? "ml-auto text-right" : "mr-auto text-left"
             }`}
           >
@@ -171,37 +182,71 @@ export default function AnalysisPage() {
             >
               <p className="whitespace-pre-wrap">{msg.content}</p>
 
+              {msg.warning && (
+                <div className="mt-3 text-xs text-yellow-300">
+                  Warning: {msg.warning}
+                </div>
+              )}
+
+              {msg.semanticQuery && (
+                <details className="mt-4 text-left">
+                  <summary className="cursor-pointer text-sm text-zinc-300">
+                    Semantic Query
+                  </summary>
+                  <pre className="mt-2 max-h-64 overflow-auto rounded bg-zinc-950 p-3 text-xs text-zinc-300">
+                    {JSON.stringify(msg.semanticQuery, null, 2)}
+                  </pre>
+                </details>
+              )}
+
+              {msg.sql && (
+                <details className="mt-3 text-left" open>
+                  <summary className="cursor-pointer text-sm text-zinc-300">
+                    Generated SQL
+                  </summary>
+                  <pre className="mt-2 max-h-64 overflow-auto rounded bg-zinc-950 p-3 text-xs text-zinc-300">
+                    {msg.sql}
+                  </pre>
+                </details>
+              )}
+
               {msg.data && msg.data.length > 0 && (
-                <div className="mt-3 overflow-x-auto">
-                  <table className="text-sm border border-zinc-700">
-                    <thead>
-                      <tr>
-                        {Object.keys(msg.data[0]).map((key) => (
-                          <th
-                            key={key}
-                            className="px-3 py-1 border border-zinc-700 text-left"
-                          >
-                            {key}
-                          </th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {msg.data.map((row, i) => (
-                        <tr key={i}>
-                          {Object.values(row).map((val, j) => (
-                            <td
-                              key={j}
-                              className="px-3 py-1 border border-zinc-700"
+                <details className="mt-3 text-left" open>
+                  <summary className="cursor-pointer text-sm text-zinc-300">
+                    Raw Result
+                  </summary>
+
+                  <div className="mt-2 overflow-x-auto">
+                    <table className="text-sm border border-zinc-700">
+                      <thead>
+                        <tr>
+                          {Object.keys(msg.data[0]).map((key) => (
+                            <th
+                              key={key}
+                              className="px-3 py-1 border border-zinc-700 text-left"
                             >
-                              {String(val)}
-                            </td>
+                              {key}
+                            </th>
                           ))}
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                      </thead>
+                      <tbody>
+                        {msg.data.map((row, i) => (
+                          <tr key={i}>
+                            {Object.values(row).map((val, j) => (
+                              <td
+                                key={j}
+                                className="px-3 py-1 border border-zinc-700"
+                              >
+                                {String(val)}
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
               )}
 
               {msg.data && msg.data.length === 0 && (
