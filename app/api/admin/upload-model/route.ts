@@ -30,13 +30,9 @@ export async function POST(req: Request) {
     const buffer = Buffer.from(await file.arrayBuffer());
     const workbook = XLSX.read(buffer, { type: "buffer" });
 
-    const tablesSheet = XLSX.utils.sheet_to_json(
-      workbook.Sheets["tables"]
-    );
+    const tablesSheet = XLSX.utils.sheet_to_json(workbook.Sheets["tables"]);
 
-    const columnsSheet = XLSX.utils.sheet_to_json(
-      workbook.Sheets["columns"]
-    );
+    const columnsSheet = XLSX.utils.sheet_to_json(workbook.Sheets["columns"]);
 
     const relationshipsSheet = XLSX.utils.sheet_to_json(
       workbook.Sheets["relationships"]
@@ -56,9 +52,15 @@ export async function POST(req: Request) {
 
       let colDef = `${col.column_name} ${mapType(col.data_type)}`;
 
-      if (col.is_primary === "yes") {
-        colDef += " PRIMARY KEY";
-      }
+      const isPrimary =
+  String(col.is_primary || "").trim().toLowerCase() === "yes" ||
+  String(col.is_primary || "").trim().toLowerCase() === "y" ||
+  String(col.is_primary || "").trim().toLowerCase() === "true" ||
+  String(col.is_primary || "").trim() === "1";
+
+if (isPrimary) {
+  colDef += " PRIMARY KEY";
+}
 
       tables[table].push(colDef);
     });
@@ -80,11 +82,62 @@ export async function POST(req: Request) {
     }
 
     // 5. Add relationships (FKs)
+    // Existing Excel format:
+    // left_table | right_table | join_type | join_condition
+    // Example:
+    // studio_rooms.id = bookings.room_id
+    //
+    // This means:
+    // bookings.room_id -> studio_rooms.id
     for (const rel of relationshipsSheet as any[]) {
-      const fromTable = rel.from_table;
-      const fromColumn = rel.from_column;
-      const toTable = rel.to_table;
-      const toColumn = rel.to_column;
+      const joinCondition = rel.join_condition;
+
+      if (!joinCondition || typeof joinCondition !== "string") {
+        return NextResponse.json({
+          success: false,
+          error: "Invalid relationship row",
+          details: `Missing join_condition in relationships sheet`,
+        });
+      }
+
+      const parts = joinCondition.split("=");
+
+      if (parts.length !== 2) {
+        return NextResponse.json({
+          success: false,
+          error: "Invalid join_condition format",
+          details: joinCondition,
+        });
+      }
+
+      const left = parts[0].trim();
+      const right = parts[1].trim();
+
+      const [leftTable, leftColumn] = left.split(".").map((x) => x.trim());
+      const [rightTable, rightColumn] = right.split(".").map((x) => x.trim());
+
+      if (!leftTable || !leftColumn || !rightTable || !rightColumn) {
+        return NextResponse.json({
+          success: false,
+          error: "Invalid relationship columns",
+          details: joinCondition,
+        });
+      }
+
+      const leftIsPrimary = leftColumn === "id";
+      const rightIsPrimary = rightColumn === "id";
+
+      let fromTable = rightTable;
+      let fromColumn = rightColumn;
+      let toTable = leftTable;
+      let toColumn = leftColumn;
+
+      if (rightIsPrimary && !leftIsPrimary) {
+        fromTable = leftTable;
+        fromColumn = leftColumn;
+        toTable = rightTable;
+        toColumn = rightColumn;
+      }
 
       const constraintName = `fk_${fromTable}_${fromColumn}`;
 
@@ -98,8 +151,14 @@ export async function POST(req: Request) {
 
       try {
         await projectDb.unsafe(fkSQL);
+        console.log(`FK created: ${constraintName}`);
       } catch (e) {
-        console.log(`FK ${constraintName} may already exist, skipping...`);
+        console.error(`Failed to create FK: ${constraintName}`, e);
+        return NextResponse.json({
+          success: false,
+          error: `Failed to create FK: ${constraintName}`,
+          details: String(e),
+        });
       }
     }
 
@@ -119,8 +178,8 @@ function mapType(type: string) {
 
   // NUMERIC TYPES
   if (
-    t === "numeric" ||           // 👈 explicit
-    t === "number" ||            // 👈 explicit
+    t === "numeric" ||
+    t === "number" ||
     t.includes("int") ||
     t.includes("decimal") ||
     t.includes("float") ||

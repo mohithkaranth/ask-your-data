@@ -33,6 +33,11 @@ export default function HomePage() {
     setLoading(false);
   }, [router]);
 
+  const handleLogout = () => {
+    localStorage.removeItem("user");
+    router.push("/login");
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen flex items-center justify-center text-white">
@@ -45,6 +50,13 @@ export default function HomePage() {
   if (user?.role === "admin") {
     return (
       <main className="min-h-screen bg-zinc-900 text-white flex flex-col items-center justify-center gap-6">
+        <button
+          onClick={handleLogout}
+          className="absolute top-6 right-6 px-4 py-2 bg-red-600 hover:bg-red-700 rounded"
+        >
+          Logout
+        </button>
+
         <h1 className="text-2xl font-semibold">Admin Dashboard</h1>
 
         <div className="flex gap-4">

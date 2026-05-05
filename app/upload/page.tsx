@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 
 type Project = {
   id: string;
@@ -12,6 +13,8 @@ type User = {
 };
 
 export default function UploadPage() {
+  const router = useRouter();
+
   const [modelFile, setModelFile] = useState<File | null>(null);
   const [dataFile, setDataFile] = useState<File | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -22,14 +25,17 @@ export default function UploadPage() {
 
   useEffect(() => {
     const storedUser = localStorage.getItem("user");
-    if (!storedUser) return;
+    if (!storedUser) {
+      router.push("/login");
+      return;
+    }
 
     const user: User = JSON.parse(storedUser);
 
     fetch(`/api/projects?email=${user.email}`)
       .then((res) => res.json())
       .then((data) => setProjects(data.projects));
-  }, []);
+  }, [router]);
 
   useEffect(() => {
     if (!selectedProject) {
@@ -61,6 +67,11 @@ export default function UploadPage() {
         setHasExistingSemantic(false);
       });
   }, [selectedProject]);
+
+  const handleLogout = () => {
+    localStorage.removeItem("user");
+    router.push("/login");
+  };
 
   const uploadModel = async () => {
     if (!modelFile || !selectedProject) {
@@ -139,7 +150,16 @@ export default function UploadPage() {
 
   return (
     <main className="min-h-screen bg-zinc-900 text-white flex flex-col items-center py-10">
-      <h1 className="text-2xl mb-6">Upload Center</h1>
+      <div className="w-full max-w-3xl flex justify-between items-center mb-6">
+        <h1 className="text-2xl">Upload Center</h1>
+
+        <button
+          onClick={handleLogout}
+          className="px-4 py-2 bg-red-600 hover:bg-red-700 rounded"
+        >
+          Logout
+        </button>
+      </div>
 
       {/* TOP */}
       <div className="w-full max-w-xl bg-zinc-800 p-6 rounded-xl mb-6">
