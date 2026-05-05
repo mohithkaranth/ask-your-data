@@ -24,6 +24,12 @@ type User = {
   role?: "admin" | "user";
 };
 
+type Favourite = {
+  id: string;
+  question: string;
+  created_at: string;
+};
+
 export default function AnalysisPage() {
   const router = useRouter();
 
@@ -34,6 +40,10 @@ export default function AnalysisPage() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState("");
 
+  const [user, setUser] = useState<User | null>(null);
+  const [favourites, setFavourites] = useState<Favourite[]>([]);
+  const [favouritesLoading, setFavouritesLoading] = useState(false);
+
   useEffect(() => {
     const storedUser = localStorage.getItem("user");
 
@@ -42,9 +52,10 @@ export default function AnalysisPage() {
       return;
     }
 
-    const user: User = JSON.parse(storedUser);
+    const parsedUser: User = JSON.parse(storedUser);
+    setUser(parsedUser);
 
-    fetch(`/api/projects?email=${user.email}`)
+    fetch(`/api/projects?email=${parsedUser.email}`)
       .then((res) => res.json())
       .then((data) => {
         const loadedProjects = data.projects || [];
@@ -56,20 +67,103 @@ export default function AnalysisPage() {
       });
   }, [router]);
 
+  const loadFavourites = async (email: string, selectedProjectId: string) => {
+    setFavouritesLoading(true);
+
+    try {
+      const res = await fetch(
+        `/api/favourites?email=${email}&projectId=${selectedProjectId}`
+      );
+
+      const data = await res.json();
+      setFavourites(data.favourites || []);
+    } catch {
+      setFavourites([]);
+    }
+
+    setFavouritesLoading(false);
+  };
+
+  useEffect(() => {
+    if (!user?.email || !projectId) {
+      setFavourites([]);
+      return;
+    }
+
+    loadFavourites(user.email, projectId);
+  }, [user?.email, projectId]);
+
   const handleLogout = () => {
     localStorage.removeItem("user");
     router.push("/login");
   };
 
-  const handleSend = async () => {
-    if (!input.trim()) return;
+  const handleSaveFavourite = async (question: string) => {
+    if (!user?.email || !projectId || !question.trim()) return;
+
+    try {
+      const res = await fetch("/api/favourites", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          email: user.email,
+          projectId,
+          question,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!data.success) {
+        throw new Error(data.error);
+      }
+
+      await loadFavourites(user.email, projectId);
+    } catch (err: any) {
+      alert(err.message || "Could not save favourite");
+    }
+  };
+
+  const handleDeleteFavourite = async (favouriteId: string) => {
+    if (!user?.email) return;
+
+    try {
+      const res = await fetch("/api/favourites", {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          email: user.email,
+          favouriteId,
+        }),
+      });
+
+      const data = await res.json();
+
+      if (!data.success) {
+        throw new Error(data.error);
+      }
+
+      setFavourites((prev) => prev.filter((fav) => fav.id !== favouriteId));
+    } catch (err: any) {
+      alert(err.message || "Could not delete favourite");
+    }
+  };
+
+  const handleSend = async (questionOverride?: string) => {
+    const questionToAsk = questionOverride || input;
+
+    if (!questionToAsk.trim()) return;
 
     if (!projectId) {
       alert("Select a project first");
       return;
     }
 
-    const userQuestion = input;
+    const userQuestion = questionToAsk;
 
     setMessages((prev) => [...prev, { role: "user", content: userQuestion }]);
 
@@ -154,6 +248,52 @@ export default function AnalysisPage() {
         </button>
       </div>
 
+      {/* FAVOURITES */}
+      {projectId && (
+        <div className="border-b border-zinc-800 bg-zinc-950/40 px-6 py-3">
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="text-sm font-medium text-zinc-200">Favourites</h2>
+            {favouritesLoading && (
+              <span className="text-xs text-zinc-500">Loading...</span>
+            )}
+          </div>
+
+          {favourites.length === 0 && !favouritesLoading && (
+            <p className="text-xs text-zinc-500">
+              No favourites saved for this project yet.
+            </p>
+          )}
+
+          {favourites.length > 0 && (
+            <div className="flex flex-wrap gap-2">
+              {favourites.map((fav) => (
+                <div
+                  key={fav.id}
+                  className="flex items-center gap-2 rounded-full border border-zinc-700 bg-zinc-800 px-3 py-1"
+                >
+                  <button
+                    onClick={() => handleSend(fav.question)}
+                    disabled={loading}
+                    className="max-w-xs truncate text-left text-xs text-zinc-200 hover:text-white disabled:opacity-50"
+                    title={fav.question}
+                  >
+                    {fav.question}
+                  </button>
+
+                  <button
+                    onClick={() => handleDeleteFavourite(fav.id)}
+                    className="text-xs text-zinc-500 hover:text-red-400"
+                    title="Delete favourite"
+                  >
+                    ×
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* CHAT AREA */}
       <div className="flex-1 overflow-y-auto p-6 space-y-4">
         {messages.length === 0 && !projectId && (
@@ -181,6 +321,15 @@ export default function AnalysisPage() {
               }`}
             >
               <p className="whitespace-pre-wrap">{msg.content}</p>
+
+              {msg.role === "user" && (
+                <button
+                  onClick={() => handleSaveFavourite(msg.content)}
+                  className="mt-2 text-xs text-blue-100 hover:text-white"
+                >
+                  Save as favourite
+                </button>
+              )}
 
               {msg.warning && (
                 <div className="mt-3 text-xs text-yellow-300">
@@ -274,7 +423,7 @@ export default function AnalysisPage() {
         />
 
         <button
-          onClick={handleSend}
+          onClick={() => handleSend()}
           disabled={loading}
           className="px-4 py-2 bg-blue-600 rounded hover:bg-blue-700 disabled:opacity-50"
         >
