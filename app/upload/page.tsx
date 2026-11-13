@@ -15,6 +15,7 @@ type User = {
 export default function UploadPage() {
   const router = useRouter();
 
+  const [workflow, setWorkflow] = useState<"scan" | "import">("scan");
   const [modelFile, setModelFile] = useState<File | null>(null);
   const [dataFile, setDataFile] = useState<File | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -91,17 +92,27 @@ export default function UploadPage() {
       return;
     }
 
+    if (!window.confirm("Replace the workbook’s tables in this project? Existing rows in those tables will be deleted.")) return;
+
     const formData = new FormData();
     formData.append("file", modelFile);
     formData.append("projectId", selectedProject);
 
-    const res = await fetch("/api/admin/upload-model", {
-      method: "POST",
-      body: formData,
-    });
-
-    const data = await res.json();
-    alert(data.success ? "Model success" : "Model failed");
+    setBusy(true);
+    try {
+      const res = await fetch("/api/admin/upload-model", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error();
+      setMessage("Model uploaded.");
+      setSemanticDraft(null);
+    } catch {
+      setMessage("Model upload failed. Check the project database before retrying.");
+    } finally {
+      setBusy(false);
+    }
   };
 
   const uploadData = async () => {
@@ -114,13 +125,20 @@ export default function UploadPage() {
     formData.append("file", dataFile);
     formData.append("projectId", selectedProject);
 
-    const res = await fetch("/api/admin/upload-data", {
-      method: "POST",
-      body: formData,
-    });
-
-    const data = await res.json();
-    alert(data.success ? "Data success" : "Data failed");
+    setBusy(true);
+    try {
+      const res = await fetch("/api/admin/upload-data", {
+        method: "POST",
+        body: formData,
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error();
+      setMessage("Data uploaded.");
+    } catch {
+      setMessage("Data upload failed. Check the project database before retrying.");
+    } finally {
+      setBusy(false);
+    }
   };
 
   const generateSemantic = async () => {
@@ -191,10 +209,13 @@ export default function UploadPage() {
       {/* TOP */}
       <div className="w-full max-w-xl bg-zinc-800 p-6 rounded-xl mb-6">
         <select
+          aria-label="Project"
           value={selectedProject}
           disabled={busy}
           onChange={(e) => {
             setMessage("");
+            setModelFile(null);
+            setDataFile(null);
             setSelectedProject(e.target.value);
           }}
           className="w-full px-4 py-2 mb-4 rounded bg-zinc-700"
@@ -207,91 +228,114 @@ export default function UploadPage() {
           ))}
         </select>
 
-        <button
-          onClick={generateSemantic}
-          disabled={!selectedProject || busy || loadingModel}
-          className="w-full py-2 bg-blue-600 rounded disabled:opacity-50"
-        >
-          {hasExistingSemantic ? "Rescan and Generate Draft" : "Scan Database and Generate Draft"}
-        </button>
-        {hasExistingSemantic && (
-          <button
-            disabled={busy}
-            onClick={() => {
-              setSemanticDraft(structuredClone(existingSemanticDraft));
-              setMessage("Published model loaded.");
-            }}
-            className="mt-3 w-full py-2 bg-zinc-700 rounded disabled:opacity-50"
-          >
-            Open Published Model
-          </button>
+        <fieldset disabled={busy} className="mb-5">
+          <legend className="mb-3 font-medium">Does this project already have database tables?</legend>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <label className="flex items-center gap-2 rounded bg-zinc-700 p-3">
+              <input type="radio" name="workflow" checked={workflow === "scan"} onChange={() => { setWorkflow("scan"); setModelFile(null); setDataFile(null); setMessage(""); }} />
+              Yes, use existing tables
+            </label>
+            <label className="flex items-center gap-2 rounded bg-zinc-700 p-3">
+              <input type="radio" name="workflow" checked={workflow === "import"} onChange={() => { setWorkflow("import"); setMessage(""); }} />
+              Import model and data
+            </label>
+          </div>
+        </fieldset>
+
+        {workflow === "scan" ? (
+          <section aria-label="Use existing tables">
+            <button
+              onClick={generateSemantic}
+              disabled={!selectedProject || busy || loadingModel}
+              className="w-full py-2 bg-blue-600 rounded disabled:opacity-50"
+            >
+              {hasExistingSemantic ? "Rescan and Generate Draft" : "Scan Database and Generate Draft"}
+            </button>
+            {hasExistingSemantic && (
+              <button
+                disabled={busy}
+                onClick={() => {
+                  setSemanticDraft(structuredClone(existingSemanticDraft));
+                  setMessage("Published model loaded.");
+                }}
+                className="mt-3 w-full py-2 bg-zinc-700 rounded disabled:opacity-50"
+              >
+                Open Published Model
+              </button>
+            )}
+          </section>
+        ) : (
+          <section aria-label="Import model and data" key={selectedProject}>
+            <p className="mb-3 text-sm text-zinc-300">Upload the model first to create its tables, then upload data to populate them.</p>
+            <p className="mb-4 text-sm text-amber-300">Uploading a model replaces matching tables and deletes their existing rows.</p>
+            <div className="grid sm:grid-cols-2 gap-4 mb-4">
+              {/* MODEL */}
+              <div className="space-y-2">
+                <label className="text-sm text-zinc-400">Model File</label>
+    
+                <label className="flex items-center justify-between px-3 py-2 bg-zinc-700 rounded cursor-pointer">
+                  <span className="text-sm text-zinc-300 truncate">
+                    {modelFile ? modelFile.name : "Select file"}
+                  </span>
+                  <span className="text-xs bg-zinc-600 px-2 py-1 rounded">
+                    Browse
+                  </span>
+                  <input
+                    type="file"
+                    disabled={busy}
+                    className="hidden"
+                    onChange={(e) => {
+                      if (e.target.files) setModelFile(e.target.files[0]);
+                    }}
+                  />
+                </label>
+    
+                <button
+                  onClick={uploadModel}
+                  disabled={!selectedProject || !modelFile || busy}
+                  className="w-full py-2 bg-blue-600 rounded disabled:opacity-50"
+                >
+                  Upload Model
+                </button>
+              </div>
+    
+              {/* DATA */}
+              <div className="space-y-2">
+                <label className="text-sm text-zinc-400">Data File</label>
+    
+                <label className="flex items-center justify-between px-3 py-2 bg-zinc-700 rounded cursor-pointer">
+                  <span className="text-sm text-zinc-300 truncate">
+                    {dataFile ? dataFile.name : "Select file"}
+                  </span>
+                  <span className="text-xs bg-zinc-600 px-2 py-1 rounded">
+                    Browse
+                  </span>
+                  <input
+                    type="file"
+                    disabled={busy}
+                    className="hidden"
+                    onChange={(e) => {
+                      if (e.target.files) setDataFile(e.target.files[0]);
+                    }}
+                  />
+                </label>
+    
+                <button
+                  onClick={uploadData}
+                  disabled={!selectedProject || !dataFile || busy}
+                  className="w-full py-2 bg-green-600 rounded disabled:opacity-50"
+                >
+                  Upload Data
+                </button>
+              </div>
+            </div>
+          </section>
         )}
         <p className="mt-3 text-sm text-zinc-300" role="status">{message}</p>
-        <details className="mt-4">
-          <summary className="mb-3 cursor-pointer text-sm text-zinc-300">Import files</summary>
-        <div className="grid grid-cols-2 gap-4 mb-4">
-          {/* MODEL */}
-          <div className="space-y-2">
-            <label className="text-sm text-zinc-400">Model File</label>
-
-            <label className="flex items-center justify-between px-3 py-2 bg-zinc-700 rounded cursor-pointer">
-              <span className="text-sm text-zinc-300 truncate">
-                {modelFile ? modelFile.name : "Select file"}
-              </span>
-              <span className="text-xs bg-zinc-600 px-2 py-1 rounded">
-                Browse
-              </span>
-              <input
-                type="file"
-                className="hidden"
-                onChange={(e) => {
-                  if (e.target.files) setModelFile(e.target.files[0]);
-                }}
-              />
-            </label>
-
-            <button
-              onClick={uploadModel}
-              className="w-full py-2 bg-blue-600 rounded"
-            >
-              Upload Model
-            </button>
-          </div>
-
-          {/* DATA */}
-          <div className="space-y-2">
-            <label className="text-sm text-zinc-400">Data File</label>
-
-            <label className="flex items-center justify-between px-3 py-2 bg-zinc-700 rounded cursor-pointer">
-              <span className="text-sm text-zinc-300 truncate">
-                {dataFile ? dataFile.name : "Select file"}
-              </span>
-              <span className="text-xs bg-zinc-600 px-2 py-1 rounded">
-                Browse
-              </span>
-              <input
-                type="file"
-                className="hidden"
-                onChange={(e) => {
-                  if (e.target.files) setDataFile(e.target.files[0]);
-                }}
-              />
-            </label>
-
-            <button
-              onClick={uploadData}
-              className="w-full py-2 bg-green-600 rounded"
-            >
-              Upload Data
-            </button>
-          </div>
-        </div>
-
-        </details>
       </div>
 
       {/* SEMANTIC */}
-      {semanticDraft && (
+      {workflow === "scan" && semanticDraft && (
         <div className="w-full max-w-3xl bg-zinc-800 p-6 rounded-xl">
           <h2 className="text-lg mb-4 text-center">Review Semantic Model</h2>
           <fieldset disabled={busy}>
