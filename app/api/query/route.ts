@@ -390,7 +390,8 @@ async function mapQuestionToSemanticQuery(
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
-      model: "gpt-4o-mini",
+      model: "gpt-6-luna",
+      reasoning_effort: "none",
       response_format: { type: "json_object" },
       messages: [
         {
@@ -505,7 +506,6 @@ FORMAT:
           content: question,
         },
       ],
-      temperature: 0,
     }),
   });
 
@@ -544,7 +544,8 @@ async function synthesizeAnswer({
       Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
-      model: "gpt-4o-mini",
+      model: "gpt-6-luna",
+      reasoning_effort: "none",
       messages: [
         {
           role: "system",
@@ -581,7 +582,6 @@ Your job:
           ),
         },
       ],
-      temperature: 0,
     }),
   });
 
