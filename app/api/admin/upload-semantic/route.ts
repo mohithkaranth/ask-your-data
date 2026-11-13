@@ -11,18 +11,12 @@ export async function POST(req: Request) {
       return NextResponse.json({ success: false, error: "Missing input" });
     }
 
-    // Remove existing semantic model for this project
-    await sql`
-      DELETE FROM semantic_models
-      WHERE project_id = ${projectId}
-    `;
-
-    // Insert new semantic model
     await sql`
       INSERT INTO semantic_models (project_id, semantic_json)
-      VALUES (${projectId}, ${semantic})
+      VALUES (${projectId}, ${JSON.stringify(semantic)})
+      ON CONFLICT (project_id)
+      DO UPDATE SET semantic_json = EXCLUDED.semantic_json
     `;
-
     return NextResponse.json({ success: true });
   } catch (err) {
     console.error(err);
