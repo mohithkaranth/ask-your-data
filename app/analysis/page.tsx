@@ -10,6 +10,7 @@ type Message = {
   sql?: string;
   semanticQuery?: any;
   data?: any[];
+  columns?: { key: string; label: string; currency?: string }[];
   warning?: string | null;
 };
 
@@ -193,6 +194,7 @@ export default function AnalysisPage() {
           role: "system",
           content: data.answer || data.sql || "Here’s your result:",
           answer: data.answer,
+          columns: data.columns,
           sql: data.sql,
           semanticQuery: data.semanticQuery,
           data: data.data,
@@ -362,19 +364,19 @@ export default function AnalysisPage() {
               {msg.data && msg.data.length > 0 && (
                 <details className="mt-3 text-left" open>
                   <summary className="cursor-pointer text-sm text-zinc-300">
-                    Raw Result
+                    Results
                   </summary>
 
                   <div className="mt-2 overflow-x-auto">
                     <table className="text-sm border border-zinc-700">
                       <thead>
                         <tr>
-                          {Object.keys(msg.data[0]).map((key) => (
+                          {(msg.columns ?? Object.keys(msg.data[0]).map(key => ({ key, label: key }))).map(({ key, label }) => (
                             <th
                               key={key}
                               className="px-3 py-1 border border-zinc-700 text-left"
                             >
-                              {key}
+                              {label}
                             </th>
                           ))}
                         </tr>
@@ -382,12 +384,12 @@ export default function AnalysisPage() {
                       <tbody>
                         {msg.data.map((row, i) => (
                           <tr key={i}>
-                            {Object.values(row).map((val, j) => (
+                            {(msg.columns ?? Object.keys(row).map(key => ({ key, label: key, currency: undefined }))).map(({ key, currency }) => (
                               <td
-                                key={j}
+                                key={key}
                                 className="px-3 py-1 border border-zinc-700"
                               >
-                                {String(val)}
+                                {row[key] == null ? "Unavailable" : currency ? new Intl.NumberFormat("en-SG", { style: "currency", currency, currencyDisplay: "code" }).format(Number(row[key])) : String(row[key])}
                               </td>
                             ))}
                           </tr>

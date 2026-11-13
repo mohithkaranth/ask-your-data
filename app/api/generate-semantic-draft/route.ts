@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { wealthMetrics } from "@/lib/wealthMetrics";
 import { sql } from "@/lib/db";
 import { getProjectDb } from "@/lib/project-db";
 
@@ -138,11 +139,11 @@ export async function POST(req: Request) {
         ...readLabel(labels?.[name]?.columns?.[field.column_name]),
       })),
     }));
-    const metrics = entities.map(entity => ({
+    const metrics = [...entities.map(entity => ({
       name: `count_${entity.name}`,
       table: entity.name,
       formula: "count(*)",
-    }));
+    })), ...(["holdings", "instrument_prices", "customers", "customer_financial_profiles", "customer_financial_positions"].every(table => grouped.has(table)) ? wealthMetrics : [])];
     const dimensions = entities.flatMap(entity => entity.columns
       .filter(column => column.type !== "number")
       .map(column => ({ table: entity.name, column: column.name, type: column.dataType })));

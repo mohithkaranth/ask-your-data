@@ -1,5 +1,6 @@
 export const runtime = "nodejs";
 
+import { wealthMetrics } from "@/lib/wealthMetrics";
 import { NextResponse } from "next/server";
 import { sql } from "@/lib/db";
 import { getProjectDb } from "@/lib/project-db";
@@ -402,7 +403,7 @@ You are a semantic query generator.
 ONLY use the following metrics and dimensions.
 
 METRICS:
-${Object.keys(semanticModel.metrics).join(", ")}
+${JSON.stringify(Object.entries(semanticModel.metrics).map(([key, value]: [string, any]) => ({ key, businessName: value.businessName, description: value.description, synonyms: value.synonyms, allowedTables: value.allowedTables })))}
 
 DIMENSIONS:
 ${dimensionsWithTypes}
@@ -475,10 +476,10 @@ ORDERING:
 - For "lowest", "least", "cheapest", "least expensive" use ASC
 - orderBy.field should be a metric when using aggregate metrics
 - For lookup/rate/cost questions without aggregate metrics, orderBy.field may be a selected numeric dimension
-- Use limit for top N queries
+- Use limit only when the user explicitly requests a top N or a row count. Omit limit for per-customer listings.
 
 RULES:
-- Use ONLY the exact names above
+- If any requested metric or dimension is unavailable, return {"unsupported":true}. Never substitute unrelated fields, component aggregates, or estimates. AUM and holding value require a market-value metric.\n- Use ONLY the exact names above
 - Do NOT invent names
 - You MUST use field names EXACTLY as provided
 - Do NOT shorten or modify field names
@@ -500,7 +501,7 @@ FORMAT:
     "field": "",
     "direction": "asc | desc"
   },
-  "limit": 10
+  "limit": null
 }
           `,
         },
@@ -532,12 +533,14 @@ async function synthesizeAnswer({
   semanticQuery,
   sql,
   rows,
+  columns,
   warning,
 }: {
   question: string;
   semanticQuery: any;
   sql: string;
   rows: any[];
+  columns: { key: string; label: string; currency?: string }[];
   warning?: string | null;
 }) {
   const res = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -563,9 +566,7 @@ Your job:
 - If relevant, compare options using the returned values.
 - If the result is empty, say no matching rows were found and suggest what may be missing.
 - If the exact requested option is missing but nearby/relevant rows are available, explain that clearly.
-- You may make a conditional estimate only if it is based on visible rows, and you must state the assumption.
-- Example style: "There is no exact 3-hour rate. If combining a 2-hour and 1-hour rate is allowed, the estimate would be..."
-- Do not treat assumptions as facts.
+- Report only values and metrics present in the result. Do not derive or estimate a missing metric from returned aggregates.
 - Keep the answer concise.
 - Do not show SQL unless asked.
           `,
@@ -578,6 +579,7 @@ Your job:
               semanticQuery,
               sql,
               rows,
+              columns,
               warning,
             },
             null,
@@ -678,13 +680,35 @@ export async function POST(req: Request) {
         ? JSON.parse(semanticRow.semantic_json)
         : semanticRow.semantic_json;
 
-    const metricsMap: Record<string, { formula: string; table?: string }> = {};
+    const metricsMap = Object.create(null) as Record<string, { formula: string; table?: string; businessName?: string; description?: string; synonyms?: string[]; currency?: string; allowedTables?: string[] }>;
     raw.metrics.forEach((m: any) => {
       metricsMap[m.name] = {
         formula: m.formula,
         table: m.table,
+        businessName: m.businessName,
+        description: m.description,
+        synonyms: m.synonyms,
+        currency: m.currency,
+        allowedTables: m.allowedTables,
       };
     });
+
+    const unsupported = () => NextResponse.json({
+      success: true,
+      answer: "This question cannot be answered with the metrics and fields defined in the semantic model.",
+      data: [],
+    });
+    const normalized = query.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const explicitWealthMetrics = wealthMetrics.filter(metric =>
+      metric.synonyms.filter(term => term !== "assets").some(term =>
+        (" " + normalized + " ").includes(" " + term.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim() + " ")
+      )
+    );
+    if (explicitWealthMetrics.some(metric => !Object.hasOwn(metricsMap, metric.name) &&
+      !Object.values(metricsMap).some(saved => [saved.businessName, ...(saved.synonyms || [])]
+        .some(label => label && metric.synonyms.some(term => term.toLowerCase() === label.toLowerCase()))))) {
+      return unsupported();
+    }
 
     const relationships = raw.relationships.map((r: any) => ({
       from: r.from_table,
@@ -733,6 +757,43 @@ export async function POST(req: Request) {
 
     console.log("SEMANTIC QUERY (RAW):", semanticQuery);
 
+    const fieldLabels = new Map<string, string>();
+    for (const entity of raw.entities) {
+      for (const column of entity.columns) {
+        fieldLabels.set(`${entity.name}.${column.name}`, column.businessName || column.name);
+      }
+    }
+    const { metrics = [], dimensions = [], filters = [], filterGroups = [], orderBy } = semanticQuery ?? {};
+    const validFilter = (filter: any) => fieldLabels.has(filter?.field) &&
+      ["=", "!=", ">", "<", ">=", "<="].includes(filter.operator);
+    if (!semanticQuery || semanticQuery.unsupported ||
+      !Array.isArray(metrics) || !Array.isArray(dimensions) ||
+      !Array.isArray(filters) || !Array.isArray(filterGroups) ||
+      (!metrics.length && !dimensions.length) ||
+      metrics.some(key => !Object.hasOwn(metricsMap, key)) ||
+      dimensions.some(field => !fieldLabels.has(field)) ||
+      !filters.every(validFilter) ||
+      !filterGroups.every(group => Array.isArray(group) && group.length && group.every(validFilter)) ||
+      (orderBy && (!(metrics.includes(orderBy.field) || dimensions.includes(orderBy.field)) ||
+        !["asc", "desc"].includes(orderBy.direction)))) return unsupported();
+
+    if (explicitWealthMetrics.some(metric => !metrics.some(key => key === metric.name ||
+      [metricsMap[key].businessName, ...(metricsMap[key].synonyms || [])].some(label =>
+        label && metric.synonyms.some(term => term.toLowerCase() === label.toLowerCase()))))) return unsupported();
+
+    const selectedTables = [...dimensions, ...filters.map(f => f.field),
+      ...filterGroups.flatMap(group => group.map((f: any) => f.field))]
+      .map(field => field.split(".")[0]);
+    for (const key of metrics) {
+      const allowed = metricsMap[key].allowedTables;
+      if (allowed && (selectedTables.some(table => !allowed.includes(table)) ||
+        metrics.some(other => other !== key && (!metricsMap[other].table || !allowed.includes(metricsMap[other].table!))))) {
+        return unsupported();
+      }
+    }
+    const limit = semanticQuery.limit;
+    semanticQuery.limit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 500) : 150;
+
     const { query: validatedQuery, warning } = validateFilters(
       semanticQuery,
       semanticModel
@@ -756,11 +817,16 @@ export async function POST(req: Request) {
 
     const result = await projectDb.unsafe(generatedSQL);
 
+    const columns = [
+      ...dimensions.map((field: string) => ({ key: field.split(".")[1], label: fieldLabels.get(field) || field })),
+      ...metrics.map((key: string) => ({ key, label: metricsMap[key].businessName || key, currency: metricsMap[key].currency })),
+    ];
     const answer = await synthesizeAnswer({
       question: query,
       semanticQuery,
       sql: generatedSQL,
       rows: result,
+      columns,
       warning,
     });
 
@@ -769,6 +835,7 @@ export async function POST(req: Request) {
       answer,
       semanticQuery,
       data: result,
+      columns,
       sql: generatedSQL,
       warning,
     });
