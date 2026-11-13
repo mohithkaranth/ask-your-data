@@ -22,6 +22,9 @@ export default function UploadPage() {
   const [semanticDraft, setSemanticDraft] = useState<any>(null);
   const [existingSemanticDraft, setExistingSemanticDraft] = useState<any>(null);
   const [hasExistingSemantic, setHasExistingSemantic] = useState(false);
+  const [loadingModel, setLoadingModel] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
 
   useEffect(() => {
     const storedUser = localStorage.getItem("user");
@@ -39,6 +42,7 @@ export default function UploadPage() {
 
   useEffect(() => {
     if (!selectedProject) {
+      setLoadingModel(false);
       setSemanticDraft(null);
       setExistingSemanticDraft(null);
       setHasExistingSemantic(false);
@@ -49,10 +53,15 @@ export default function UploadPage() {
     setExistingSemanticDraft(null);
     setHasExistingSemantic(false);
 
-    fetch(`/api/admin/get-semantic?projectId=${selectedProject}`)
-      .then((res) => res.json())
+    setLoadingModel(true);
+    const controller = new AbortController();
+    fetch(`/api/admin/get-semantic?projectId=${encodeURIComponent(selectedProject)}`, { signal: controller.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error("Could not load the published model.");
+        return res.json();
+      })
       .then((data) => {
-        if (data.exists) {
+        if (data.exists && !controller.signal.aborted) {
           const parsedSemantic =
             typeof data.semantic === "string"
               ? JSON.parse(data.semantic)
@@ -63,9 +72,12 @@ export default function UploadPage() {
         }
       })
       .catch(() => {
-        setExistingSemanticDraft(null);
-        setHasExistingSemantic(false);
+        if (!controller.signal.aborted) setMessage("Could not load the published model.");
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoadingModel(false);
       });
+    return () => controller.abort();
   }, [selectedProject]);
 
   const handleLogout = () => {
@@ -112,46 +124,61 @@ export default function UploadPage() {
   };
 
   const generateSemantic = async () => {
-    if (!selectedProject) {
-      alert("Select project");
-      return;
+    setBusy(true);
+    setMessage("Scanning PostgreSQL and drafting business terms…");
+    try {
+      const user: User = JSON.parse(localStorage.getItem("user") || "null");
+      const res = await fetch("/api/generate-semantic-draft", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: selectedProject, email: user.email }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.error || "Could not generate a draft.");
+      const draft = data.semanticDraft;
+      const prior = semanticDraft || existingSemanticDraft;
+      if (prior) {
+        const labelKeys = ["businessName", "description", "synonyms"] as const;
+        const preserveLabels = (target: any, source: any) => {
+          for (const key of labelKeys) {
+            if (source?.[key] !== undefined) target[key] = source[key];
+          }
+        };
+        for (const entity of draft.entities) {
+          const previous = prior.entities.find((item: any) => item.name === entity.name);
+          preserveLabels(entity, previous);
+          for (const column of entity.columns) {
+            preserveLabels(column, previous?.columns.find((item: any) => item.name === column.name));
+          }
+        }
+        draft.metrics = [
+          ...prior.metrics,
+          ...draft.metrics.filter((metric: any) => !prior.metrics.some((item: any) => item.name === metric.name)),
+        ];
+        const currentFields = new Set(draft.entities.flatMap((entity: any) =>
+          entity.columns.map((column: any) => entity.name + "." + column.name)
+        ));
+        const removed = prior.entities.flatMap((entity: any) =>
+          entity.columns.map((column: any) => entity.name + "." + column.name)
+        ).filter((field: string) => !currentFields.has(field));
+        setMessage(removed.length
+          ? `Draft ready. ${removed.length} previous fields are absent from this scan. Review saved metric formulas before publishing.`
+          : `Draft ready. Found ${draft.entities.length} tables and views.`);
+      } else {
+        setMessage(`Draft ready. Found ${draft.entities.length} tables and views.`);
+      }
+      setSemanticDraft(draft);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not generate a draft.");
+    } finally {
+      setBusy(false);
     }
-
-    const res = await fetch("/api/generate-semantic-draft", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ projectId: selectedProject }),
-    });
-
-    const data = await res.json();
-
-    if (data.success) {
-      setSemanticDraft(data.semanticDraft);
-    } else {
-      alert("Failed to generate semantic");
-    }
-  };
-
-  const handleSemanticButtonClick = async () => {
-    if (!selectedProject) {
-      alert("Select project");
-      return;
-    }
-
-    if (hasExistingSemantic) {
-      setSemanticDraft(existingSemanticDraft);
-      return;
-    }
-
-    await generateSemantic();
   };
 
   return (
     <main className="min-h-screen bg-zinc-900 text-white flex flex-col items-center py-10">
       <div className="w-full max-w-3xl flex justify-between items-center mb-6">
-        <h1 className="text-2xl">Upload Center</h1>
+        <h1 className="text-2xl">Semantic Model</h1>
 
         <button
           onClick={handleLogout}
@@ -165,7 +192,11 @@ export default function UploadPage() {
       <div className="w-full max-w-xl bg-zinc-800 p-6 rounded-xl mb-6">
         <select
           value={selectedProject}
-          onChange={(e) => setSelectedProject(e.target.value)}
+          disabled={busy}
+          onChange={(e) => {
+            setMessage("");
+            setSelectedProject(e.target.value);
+          }}
           className="w-full px-4 py-2 mb-4 rounded bg-zinc-700"
         >
           <option value="">Select Project</option>
@@ -176,6 +207,28 @@ export default function UploadPage() {
           ))}
         </select>
 
+        <button
+          onClick={generateSemantic}
+          disabled={!selectedProject || busy || loadingModel}
+          className="w-full py-2 bg-blue-600 rounded disabled:opacity-50"
+        >
+          {hasExistingSemantic ? "Rescan and Generate Draft" : "Scan Database and Generate Draft"}
+        </button>
+        {hasExistingSemantic && (
+          <button
+            disabled={busy}
+            onClick={() => {
+              setSemanticDraft(structuredClone(existingSemanticDraft));
+              setMessage("Published model loaded.");
+            }}
+            className="mt-3 w-full py-2 bg-zinc-700 rounded disabled:opacity-50"
+          >
+            Open Published Model
+          </button>
+        )}
+        <p className="mt-3 text-sm text-zinc-300" role="status">{message}</p>
+        <details className="mt-4">
+          <summary className="mb-3 cursor-pointer text-sm text-zinc-300">Import files</summary>
         <div className="grid grid-cols-2 gap-4 mb-4">
           {/* MODEL */}
           <div className="space-y-2">
@@ -234,35 +287,47 @@ export default function UploadPage() {
           </div>
         </div>
 
-        <button
-          onClick={handleSemanticButtonClick}
-          className="w-full py-2 bg-yellow-600 rounded"
-        >
-          {hasExistingSemantic
-            ? "Show Current Semantic Layer"
-            : "Generate Semantic Layer"}
-        </button>
+        </details>
       </div>
 
       {/* SEMANTIC */}
       {semanticDraft && (
         <div className="w-full max-w-3xl bg-zinc-800 p-6 rounded-xl">
-          <h2 className="text-lg mb-4 text-center">Semantic Layer</h2>
+          <h2 className="text-lg mb-4 text-center">Review Semantic Model</h2>
+          <fieldset disabled={busy}>
 
           {/* ENTITIES */}
           {semanticDraft.entities.map((entity: any) => (
             <div key={entity.name} className="mb-4">
               <h3 className="text-blue-400 mb-2">{entity.name}</h3>
+              <div className="mb-3 grid gap-2 sm:grid-cols-3">
+                {(["businessName", "description", "synonyms"] as const).map((key) => (
+                  <input
+                    key={key}
+                    aria-label={entity.name + " " + key}
+                    placeholder={{ businessName: "Table business name", description: "Table description", synonyms: "Table synonyms, comma separated" }[key]}
+                    value={key === "synonyms" ? (entity[key] || []).join(",") : entity[key] || ""}
+                    onChange={(e) => {
+                      const updated = structuredClone(semanticDraft);
+                      const target = updated.entities.find((item: any) => item.name === entity.name);
+                      target[key] = key === "synonyms" ? e.target.value.split(",") : e.target.value;
+                      setSemanticDraft(updated);
+                    }}
+                    className="min-w-0 px-3 py-1 bg-zinc-700 rounded"
+                  />
+                ))}
+              </div>
 
               {entity.columns.map((col: any, i: number) => (
-                <div key={i} className="flex gap-4 mb-2">
-                  <span className="w-[180px] text-zinc-400">{col.name}</span>
+                <div key={col.name} className="grid gap-2 mb-2 md:grid-cols-4">
+                  <span className="break-all text-zinc-400">{col.name} <small>{col.dataType}{col.primaryKey ? " · PK" : ""}</small></span>
 
                   <input
+                    aria-label={`Business name of ${entity.name}.${col.name}`}
                     placeholder="Business name"
                     value={col.businessName || ""}
                     onChange={(e) => {
-                      const updated = { ...semanticDraft };
+                      const updated = structuredClone(semanticDraft);
 
                       updated.entities
                         .find((e: any) => e.name === entity.name)
@@ -272,10 +337,45 @@ export default function UploadPage() {
                     }}
                     className="flex-1 px-3 py-1 bg-zinc-700 rounded"
                   />
+                  <input
+                    aria-label={`Description of ${entity.name}.${col.name}`}
+                    placeholder="Description"
+                    value={col.description || ""}
+                    onChange={(e) => {
+                      const updated = structuredClone(semanticDraft);
+                      updated.entities.find((item: any) => item.name === entity.name).columns[i].description = e.target.value;
+                      setSemanticDraft(updated);
+                    }}
+                    className="flex-1 min-w-0 px-3 py-1 bg-zinc-700 rounded"
+                  />
+                  <input
+                    aria-label={`Synonyms for ${entity.name}.${col.name}`}
+                    placeholder="Synonyms, comma separated"
+                    value={(col.synonyms || []).join(",")}
+                    onChange={(e) => {
+                      const updated = structuredClone(semanticDraft);
+                      updated.entities.find((item: any) => item.name === entity.name).columns[i].synonyms = e.target.value.split(",");
+                      setSemanticDraft(updated);
+                    }}
+                    className="min-w-0 px-3 py-1 bg-zinc-700 rounded"
+                  />
                 </div>
               ))}
             </div>
           ))}
+
+          <details className="my-4">
+            <summary className="cursor-pointer">Database relationships</summary>
+            <ul className="mt-2 space-y-1 text-sm text-zinc-300">
+              {semanticDraft.relationships.map((rel: any, index: number) => (
+                <li key={index}>
+                  {(rel.pairs || [rel]).map((pair: any) =>
+                    `${rel.from_table}.${pair.from_column} → ${rel.to_table}.${pair.to_column}`
+                  ).join(" and ")}
+                </li>
+              ))}
+            </ul>
+          </details>
 
           {/* METRICS */}
           <h2 className="text-lg mt-6 mb-2 text-center">Metrics</h2>
@@ -287,7 +387,7 @@ export default function UploadPage() {
                   placeholder="Metric name"
                   value={m.name || ""}
                   onChange={(e) => {
-                    const updated = { ...semanticDraft };
+                    const updated = structuredClone(semanticDraft);
                     updated.metrics[i].name = e.target.value;
                     setSemanticDraft(updated);
                   }}
@@ -298,7 +398,7 @@ export default function UploadPage() {
                   placeholder="Business name"
                   value={m.businessName || ""}
                   onChange={(e) => {
-                    const updated = { ...semanticDraft };
+                    const updated = structuredClone(semanticDraft);
                     updated.metrics[i].businessName = e.target.value;
                     setSemanticDraft(updated);
                   }}
@@ -307,7 +407,7 @@ export default function UploadPage() {
 
                 <button
                   onClick={() => {
-                    const updated = { ...semanticDraft };
+                    const updated = structuredClone(semanticDraft);
                     updated.metrics.splice(i, 1);
                     setSemanticDraft(updated);
                   }}
@@ -321,7 +421,7 @@ export default function UploadPage() {
                 placeholder="Formula e.g. sum(CAST(holdings.quantity AS numeric) * CAST(holdings.avg_price AS numeric))"
                 value={m.formula || ""}
                 onChange={(e) => {
-                  const updated = { ...semanticDraft };
+                  const updated = structuredClone(semanticDraft);
                   updated.metrics[i].formula = e.target.value;
                   setSemanticDraft(updated);
                 }}
@@ -354,24 +454,29 @@ export default function UploadPage() {
 
           <button
             onClick={async () => {
-              const res = await fetch("/api/admin/upload-semantic", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                },
-                body: JSON.stringify({
-                  projectId: selectedProject,
-                  semantic: semanticDraft,
-                }),
-              });
-
-              const data = await res.json();
-              alert(data.success ? "Semantic saved" : "Failed");
+              setBusy(true);
+              try {
+                const res = await fetch("/api/admin/upload-semantic", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ projectId: selectedProject, semantic: semanticDraft }),
+                });
+                const data = await res.json();
+                if (!res.ok || !data.success) throw new Error("Publish failed.");
+                setExistingSemanticDraft(structuredClone(semanticDraft));
+                setHasExistingSemantic(true);
+                setMessage("Semantic model published.");
+              } catch {
+                setMessage("Could not publish the semantic model.");
+              } finally {
+                setBusy(false);
+              }
             }}
             className="mt-6 ml-3 px-4 py-2 bg-purple-600 rounded"
           >
-            Save Semantic Layer
+            Publish Semantic Model
           </button>
+          </fieldset>
         </div>
       )}
     </main>
