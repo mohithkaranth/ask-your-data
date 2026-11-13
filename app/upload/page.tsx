@@ -25,6 +25,7 @@ export default function UploadPage() {
   const [hasExistingSemantic, setHasExistingSemantic] = useState(false);
   const [loadingModel, setLoadingModel] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [publishStatus, setPublishStatus] = useState<{ kind: "pending" | "success" | "error"; text: string } | null>(null);
   const [message, setMessage] = useState("");
 
   useEffect(() => {
@@ -142,6 +143,7 @@ export default function UploadPage() {
   };
 
   const generateSemantic = async () => {
+    setPublishStatus(null);
     setBusy(true);
     setMessage("Scanning PostgreSQL and drafting business terms…");
     try {
@@ -214,6 +216,7 @@ export default function UploadPage() {
           disabled={busy}
           onChange={(e) => {
             setMessage("");
+            setPublishStatus(null);
             setModelFile(null);
             setDataFile(null);
             setSelectedProject(e.target.value);
@@ -256,6 +259,7 @@ export default function UploadPage() {
                 disabled={busy}
                 onClick={() => {
                   setSemanticDraft(structuredClone(existingSemanticDraft));
+                  setPublishStatus(null);
                   setMessage("Published model loaded.");
                 }}
                 className="mt-3 w-full py-2 bg-zinc-700 rounded disabled:opacity-50"
@@ -497,8 +501,10 @@ export default function UploadPage() {
           </button>
 
           <button
+            type="button"
             onClick={async () => {
               setBusy(true);
+              setPublishStatus({ kind: "pending", text: "Publishing semantic model…" });
               try {
                 const res = await fetch("/api/admin/upload-semantic", {
                   method: "POST",
@@ -506,20 +512,29 @@ export default function UploadPage() {
                   body: JSON.stringify({ projectId: selectedProject, semantic: semanticDraft }),
                 });
                 const data = await res.json();
-                if (!res.ok || !data.success) throw new Error("Publish failed.");
+                if (!res.ok || !data.success) {
+                  setPublishStatus({ kind: "error", text: data.error || "Could not publish the semantic model." });
+                  return;
+                }
                 setExistingSemanticDraft(structuredClone(semanticDraft));
                 setHasExistingSemantic(true);
-                setMessage("Semantic model published.");
+                setPublishStatus({ kind: "success", text: "Semantic model published." });
               } catch {
-                setMessage("Could not publish the semantic model.");
+                setPublishStatus({ kind: "error", text: "Could not reach the server. Try again." });
               } finally {
                 setBusy(false);
               }
             }}
-            className="mt-6 ml-3 px-4 py-2 bg-purple-600 rounded"
+            className="mt-6 ml-3 px-4 py-2 bg-purple-600 rounded disabled:opacity-50"
           >
-            Publish Semantic Model
+            {publishStatus?.kind === "pending" ? "Publishing…" : "Publish Semantic Model"}
           </button>
+          <p
+            role="status"
+            className={`mt-3 text-sm ${publishStatus?.kind === "error" ? "text-red-300" : "text-zinc-300"}`}
+          >
+            {publishStatus?.text}
+          </p>
           </fieldset>
         </div>
       )}
